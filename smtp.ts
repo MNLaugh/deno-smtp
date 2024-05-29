@@ -27,12 +27,13 @@ interface SmtpClientOptions {
 }
 
 export class SmtpClient {
-  private _conn: Deno.Conn | null;
+  private _conn: Deno.TcpConn | Deno.TlsConn | null;
   private _reader: TextProtoReader | null;
   private _writer: BufWriter | null;
 
   private _console_debug = false;
   private _content_encoding: ContentTransferEncoding;
+  private secure = false;
 
   constructor({
     content_encoding = ContentTransferEncoding["quoted-printable"],
@@ -52,7 +53,7 @@ export class SmtpClient {
     this._content_encoding = _content_encoding as ContentTransferEncoding;
   }
 
-  async connect(config: ConnectConfig | ConnectConfigWithAuthentication) {
+  async connect(config: ConnectConfig | ConnectConfigWithAuthentication): Promise<void> {
     const conn = await Deno.connect({
       hostname: config.hostname,
       port: config.port || 25,
@@ -61,10 +62,11 @@ export class SmtpClient {
   }
 
   async connectTLS(config: ConnectConfig | ConnectConfigWithAuthentication) {
-    const conn = await Deno.connectTls({
+    const conn = await Deno.connect({
       hostname: config.hostname,
       port: config.port || 465,
     });
+    this.secure = true;
     await this._connect(conn, config);
   }
 
@@ -115,12 +117,12 @@ export class SmtpClient {
     this.assertCode(await this.readCmd(), CommandCode.OK);
   }
 
-  private async _connect(conn: Deno.Conn, config: ConnectConfig) {
+  private async _connect(conn: Deno.TcpConn, config: ConnectConfig) {
     this._conn = conn;
     const reader = new BufReader(this._conn);
     this._writer = new BufWriter(this._conn);
     this._reader = new TextProtoReader(reader);
-
+    
     this.assertCode(await this.readCmd(), CommandCode.READY);
 
     await this.writeCmd("EHLO", config.hostname);
@@ -129,14 +131,31 @@ export class SmtpClient {
       if (!cmd || !cmd.args.startsWith("-")) break;
     }
 
+    if (this.secure) {
+      const resStartTLS = await this.sendCmd("STARTTLS");
+      this.assertCode(resStartTLS, CommandCode.READY);
+      this._conn = await Deno.startTls(this._conn, {
+        hostname: config.hostname,
+      });
+      this._reader = new TextProtoReader(new BufReader(this._conn));
+      this._writer = new BufWriter(this._conn);
+
+      await this.writeCmd("EHLO", config.hostname);
+      while (true) {
+        const cmd = await this.readCmd();
+        if (!cmd || !cmd.args.startsWith("-")) break;
+      }
+    }
+
     if (this.useAuthentication(config)) {
-      await this.writeCmd("AUTH", "LOGIN");
-      this.assertCode(await this.readCmd(), 334);
+      // AUTH LOGIN 
+      this.assertCode(await this.sendCmd("AUTH", "LOGIN"), 334);
 
       await this.writeCmd(btoa(config.username));
       this.assertCode(await this.readCmd(), 334);
 
       await this.writeCmd(btoa(config.password));
+      
       this.assertCode(await this.readCmd(), CommandCode.AUTHO_SUCCESS);
     }
   }
@@ -150,10 +169,20 @@ export class SmtpClient {
     }
   }
 
+  private async sendCmd(...args: string[]) {
+    await this.writeCmd(...args);
+    const response = await this.readCmd();
+    if (!response) {
+      throw new Error("No response from server");
+    }
+    return response;
+  }
+
   private async readCmd(): Promise<Command | null> {
     if (!this._reader) {
       return null;
     }
+
     const result = await this._reader.readLine();
     if (result === null) return null;
     const cmdCode = parseInt(result.slice(0, 3).trim());
